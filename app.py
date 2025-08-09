@@ -108,4 +108,25 @@ def nowpayments_webhook():
             from telegram import Bot
             bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
             user = db.query(User).filter(User.id == subscription.user_id).first()
-           
+            if user:
+                send_welcome_message(bot, user.telegram_id, subscription.strategy)
+        db.close()
+    return jsonify({"status": "ok"})
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+
+def run_telegram_bot():
+    updater = Updater(os.getenv("TELEGRAM_TOKEN"))
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CallbackQueryHandler(subscription_choice))
+    dp.add_handler(CommandHandler("analysis", analysis))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    import threading
+    threading.Thread(target=run_flask).start()
+    threading.Thread(target=run_telegram_bot).start()
