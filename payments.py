@@ -1,25 +1,28 @@
 import requests
 import os
-from config import NOWPAYMENTS_API_KEY, SUBSCRIPTION_PRICE_USD
 
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
 NOWPAYMENTS_API_URL = "https://api.nowpayments.io/v1/invoice"
 
-headers = {
+HEADERS = {
     "x-api-key": NOWPAYMENTS_API_KEY,
     "Content-Type": "application/json"
 }
 
-def create_invoice(telegram_id: str):
+def create_invoice_nowpayments(subscription_id: int, amount: float, currency: str = "USDT"):
     data = {
-        "price_amount": SUBSCRIPTION_PRICE_USD,
-        "price_currency": "usd",
-        "pay_currency": "usdt",
-        "ipn_callback_url": os.getenv("IPN_CALLBACK_URL"),  # رابط Webhook عندك
-        "order_id": telegram_id,  # نستخدم معرف تيليجرام لربط الدفع بالمستخدم
-        "order_description": "اشتراك بوت إشارات التداول لمدة 30 يوم"
+        "price_amount": amount,
+        "price_currency": currency,
+        "order_id": str(subscription_id),
+        "order_description": f"Subscription payment #{subscription_id}",
+        "ipn_callback_url": os.getenv("NOWPAYMENTS_IPN_CALLBACK_URL"),
+        "success_url": os.getenv("NOWPAYMENTS_SUCCESS_URL"),
+        "cancel_url": os.getenv("NOWPAYMENTS_CANCEL_URL"),
     }
-    response = requests.post(NOWPAYMENTS_API_URL, json=data, headers=headers)
+    response = requests.post(NOWPAYMENTS_API_URL, headers=HEADERS, json=data)
     if response.status_code == 201:
-        return response.json()  # تحتوي على رابط الدفع invoice_url وغيره
+        result = response.json()
+        return result["invoice_url"], result["id"]
     else:
-        return None
+        print(f"Failed to create invoice: {response.text}")
+        return None, None
