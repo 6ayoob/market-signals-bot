@@ -1,8 +1,8 @@
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Float, JSON, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, JSON, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
 
-DATABASE_URL = "sqlite:///./market_signals_bot.db"  # نبدأ بـ SQLite للسهولة
+DATABASE_URL = "sqlite:///./market_signals_bot.db"
 
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -23,6 +23,7 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
+    strategy = Column(String, nullable=False, default="strategy_one")
     status = Column(String, default="pending")  # pending, active, expired
     start_date = Column(DateTime, nullable=True)
     end_date = Column(DateTime, nullable=True)
@@ -38,7 +39,7 @@ class SignalLog(Base):
     signal_id = Column(String, nullable=True)
     symbol = Column(String, nullable=True)
     entry_price = Column(Float, nullable=True)
-    tps = Column(JSON, nullable=True)  # أهداف الربح مثلا [4,8,15]
+    tps = Column(JSON, nullable=True)
     sl = Column(Float, nullable=True)
     sent_at = Column(DateTime, default=datetime.utcnow)
     sent_to_count = Column(Integer, default=0)
