@@ -1,232 +1,218 @@
-# app.py
 import os
-import threading
 import json
-import logging
 from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
+import requests
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-from models import SessionLocal, init_db, User, Subscription
-from services import get_or_create_user  # إذا عندك services.py
-from nowpayments import create_invoice, verify_nowpayments_signature
-from config import (
-    TELEGRAM_TOKEN,
-    PRICE_STRATEGY_ONE_USD,
-    PRICE_STRATEGY_TWO_USD,
-    SUBSCRIPTION_DURATION_DAYS
-)
+# === إعدادات ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ضع_توكن_البوت_هنا")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "ضع_IPN_SECRET_هنا")
 
-import strategy_one
-import strategy_two
+WEBHOOK_ROUTE = f"/telegram-webhook"
+NOWPAYMENTS_ROUTE = f"/nowpayments-webhook"
+PORT = int(os.getenv("PORT", 5000))
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# === قاعدة البيانات ===
+DATABASE_URL = "sqlite:///./bot_subscriptions.db"
+Base = declarative_base()
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
 
-# init DB
-init_db()
+# === موديلات البيانات ===
 
-# Flask app
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(String, unique=True, index=True, nullable=False)
+    username = Column(String, nullable=True)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    subscriptions = relationship("Subscription", back_populates="user")
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    start_date = Column(DateTime)
+    end_date = Column(DateTime)
+    status = Column(String, default="active")  # active, expired
+    payment_id = Column(String, nullable=True)
+    amount = Column(Float, nullable=True)
+    currency = Column(String, nullable=True)
+    user = relationship("User", back_populates="subscriptions")
+
+Base.metadata.create_all(bind=engine)
+
+# === تهيئة Flask ===
 app = Flask(__name__)
 
-# ---------- Telegram bot handlers ----------
-def start_telegram_bot():
-    if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN not set in env")
-        return
+# === دوال مساعدة ===
 
-    updater = Updater(TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
+def send_message(chat_id, text):
+    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
 
-    def start(update, context):
-        keyboard = [
-            [InlineKeyboardButton("اشتراك 1 - $40", callback_data='strategy_one')],
-            [InlineKeyboardButton("اشتراك 2 - $70", callback_data='strategy_two')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        update.message.reply_text('أهلاً! اختر الاشتراك المناسب لك:', reply_markup=reply_markup)
+def get_user(session, telegram_id, create_if_not_exist=True, user_info=None):
+    user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
+    if not user and create_if_not_exist:
+        user = User(
+            telegram_id=str(telegram_id),
+            username=user_info.get("username") if user_info else None,
+            first_name=user_info.get("first_name") if user_info else None,
+            last_name=user_info.get("last_name") if user_info else None,
+        )
+        session.add(user)
+        session.commit()
+    return user
 
-    def subscription_choice(update, context):
-        query = update.callback_query
-        chosen = query.data
-        telegram_id = str(query.from_user.id)
+def get_active_subscription(session, user_id):
+    now = datetime.utcnow()
+    return session.query(Subscription).filter(
+        Subscription.user_id == user_id,
+        Subscription.status == "active",
+        Subscription.start_date <= now,
+        Subscription.end_date >= now
+    ).first()
+
+def expire_subscriptions():
+    session = SessionLocal()
+    now = datetime.utcnow()
+    expired = session.query(Subscription).filter(
+        Subscription.status == "active",
+        Subscription.end_date < now
+    ).all()
+    for sub in expired:
+        sub.status = "expired"
+        session.add(sub)
+    session.commit()
+    session.close()
+
+# === مسار Telegram Webhook ===
+@app.route(WEBHOOK_ROUTE, methods=["POST"])
+def telegram_webhook():
+    expire_subscriptions()
+    update = request.get_json()
+    if "message" in update:
+        message = update["message"]
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "")
+        from_user = message.get("from", {})
+        telegram_id = str(from_user.get("id"))
 
         session = SessionLocal()
-        try:
-            user = session.query(User).filter_by(telegram_id=telegram_id).first()
-            if not user:
-                user = User(
-                    telegram_id=telegram_id,
-                    username=query.from_user.username,
-                    first_name=query.from_user.first_name,
-                    last_name=query.from_user.last_name
-                )
-                session.add(user)
-                session.commit()
-                session.refresh(user)
-
-            # منع الاشتراك المتكرر (pending أو active)
-            existing_sub = session.query(Subscription).filter(
-                Subscription.user_id == user.id,
-                Subscription.status.in_(["pending", "active"])
-            ).first()
-
-            if existing_sub:
-                query.answer()
-                query.edit_message_text("لديك اشتراك مفتوح أو قيد الانتظار، يرجى إتمام الدفع أو انتظار انتهاء الاشتراك.")
-                return
-
-            price = PRICE_STRATEGY_ONE_USD if chosen == "strategy_one" else PRICE_STRATEGY_TWO_USD
-
-            new_sub = Subscription(
-                user_id=user.id,
-                strategy=chosen,
-                status="pending",  # ينتظر الدفع
-                start_date=None,
-                end_date=None,
-                payment_id=None,
-                amount=price,
-                currency="usd"
-            )
-            session.add(new_sub)
-            session.commit()
-            session.refresh(new_sub)
-
-            # إنشاء فاتورة NowPayments (order_id = subscription.id)
-            invoice_url, invoice_id = create_invoice(new_sub.id, amount_usd=price)
-            if invoice_url:
-                # احفظ معرف الفاتورة لربطه لاحقًا
-                new_sub.payment_id = invoice_id
-                session.commit()
-                query.answer()
-                query.edit_message_text(f"تم إنشاء فاتورة الدفع، الرجاء الدفع عبر الرابط التالي:\n{invoice_url}")
-            else:
-                query.answer()
-                query.edit_message_text("حدث خطأ أثناء إنشاء الفاتورة، حاول لاحقًا.")
-        except Exception as e:
-            logger.exception("subscription_choice error")
-            query.answer()
-            query.edit_message_text("حدث خطأ داخلي، حاول لاحقًا.")
-        finally:
-            session.close()
-
-    def analysis(update, context):
-        telegram_id = str(update.effective_user.id)
-        session = SessionLocal()
-        try:
-            sub = session.query(Subscription).join(User).filter(
-                User.telegram_id == telegram_id,
-                Subscription.status == "active",
-                Subscription.start_date <= datetime.utcnow(),
-                Subscription.end_date >= datetime.utcnow()
-            ).order_by(Subscription.end_date.desc()).first()
-        finally:
-            session.close()
+        user = get_user(session, telegram_id, True, from_user)
+        sub = get_active_subscription(session, user.id)
+        session.close()
 
         if not sub:
-            update.message.reply_text("ليس لديك اشتراك نشط، يرجى الاشتراك أولاً.")
-            return
+            send_message(chat_id, "🚫 يرجى الاشتراك أولاً للدخول إلى الخدمة.\n\n"\
+                                 "استخدم /subscribe للاطلاع على الخطط المتاحة.")
+            return "ok"
 
-        symbols = ["BTC-USDT", "ETH-USDT", "XRP-USDT"]
-        msgs = []
-        if sub.strategy == "strategy_one":
-            for s in symbols:
-                if strategy_one.check_signal(s):
-                    msgs.append(f"📈 توصية شراء لـ {s} (استراتيجية 1)")
-        else:
-            for s in symbols:
-                if strategy_two.check_signal(s):
-                    msgs.append(f"🚀 توصية شراء لـ {s} (استراتيجية 2)")
-
-        if msgs:
-            for m in msgs:
-                update.message.reply_text(m)
-        else:
-            update.message.reply_text("لا توجد توصيات حالياً.")
-
-    def status(update, context):
-        telegram_id = str(update.effective_user.id)
-        session = SessionLocal()
-        try:
-            sub = session.query(Subscription).join(User).filter(
-                User.telegram_id == telegram_id,
-                Subscription.status == "active",
-                Subscription.end_date >= datetime.utcnow()
-            ).order_by(Subscription.end_date.desc()).first()
-        finally:
-            session.close()
-
-        if sub:
-            text = (f"اشتراكك: {'اشتراك 1' if sub.strategy == 'strategy_one' else 'اشتراك 2'}\n"
-                    f"الحالة: {sub.status}\n"
-                    f"ينتهي في: {sub.end_date.strftime('%Y-%m-%d')}")
-        else:
-            text = "لا يوجد اشتراك نشط حالياً."
-        update.message.reply_text(text)
-
-    def help_cmd(update, context):
-        txt = "/start - بدء الاشتراك\n/analysis - استلام التوصيات\n/status - حالة الاشتراك\n/help - مساعدة"
-        update.message.reply_text(txt)
-
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CallbackQueryHandler(subscription_choice))
-    dp.add_handler(CommandHandler("analysis", analysis))
-    dp.add_handler(CommandHandler("status", status))
-    dp.add_handler(CommandHandler("help", help_cmd))
-
-    updater.start_polling()
-    updater.idle()
-
-# ---------- Flask Webhook ----------
-@app.route("/nowpayments/webhook", methods=["POST"])
-def nowpayments_webhook():
-    raw = request.data
-    sig = request.headers.get("x-nowpayments-signature", "")  # حسب تهيئة NowPayments
-    # تحقق التوقيع
-    if not verify_nowpayments_signature(raw, sig):
-        logger.warning("Invalid NowPayments signature")
-        return jsonify({"error": "invalid signature"}), 400
-
-    data = request.json or {}
-    payment_status = data.get("payment_status")  # e.g. "finished"
-    invoice_id = data.get("id") or data.get("invoice_id") or data.get("payment_id")
-    order_id = data.get("order_id")  # هو الـ subscription.id لأننا أرسلناه كـ order_id
-
-    logger.info(f"NowPayments IPN: status={payment_status}, order_id={order_id}, invoice_id={invoice_id}")
-
-    if payment_status == "finished" and order_id:
-        session = SessionLocal()
-        try:
-            sub = session.query(Subscription).filter(Subscription.id == int(order_id)).first()
-            if sub and sub.payment_id == invoice_id:
-                # تفعل الاشتراك
-                sub.status = "active"
-                sub.start_date = datetime.utcnow()
-                sub.end_date = datetime.utcnow() + timedelta(days=SUBSCRIPTION_DURATION_DAYS)
+        # أوامر البوت
+        if text == "/start":
+            send_message(chat_id, f"مرحبًا {user.first_name or ''} 👋\n"
+                                  "البوت يعمل بنجاح.\n"
+                                  "استخدم /help لمعرفة الأوامر.")
+        elif text == "/help":
+            send_message(chat_id,
+                "/subscribe - الاشتراك في الخدمة\n"
+                "/status - حالة الاشتراك\n"
+                "/advice - تلقي توصية وتحليل\n"
+                "/cancel - إلغاء الاشتراك")
+        elif text == "/subscribe":
+            send_message(chat_id,
+                "خطط الاشتراك:\n"
+                "1️⃣ اشتراك 1 بسعر 40$ (استراتيجية 1)\n"
+                "2️⃣ اشتراك 2 بسعر 70$ (استراتيجية 2)\n"
+                "يرجى زيارة الرابط للدفع (يتم إرساله من إدارة البوت تلقائيًا بعد طلب الاشتراك).")
+        elif text == "/status":
+            send_message(chat_id,
+                         f"حالة اشتراكك:\n"
+                         f"من: {sub.start_date.strftime('%Y-%m-%d')}\n"
+                         f"إلى: {sub.end_date.strftime('%Y-%m-%d')}\n"
+                         f"الحالة: {sub.status}")
+        elif text == "/cancel":
+            session = SessionLocal()
+            sub = get_active_subscription(session, user.id)
+            if sub:
+                sub.status = "expired"
+                session.add(sub)
                 session.commit()
-
-                # إرسال رسالة ترحيب للمشترك
-                try:
-                    bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
-                    user = session.query(User).filter(User.id == sub.user_id).first()
-                    if user:
-                        welcome = "تم تفعيل اشتراكك بنجاح! شكراً لدعمك — ستحصل على التوصيات الآن."
-                        bot.send_message(chat_id=user.telegram_id, text=welcome)
-                except Exception as e:
-                    logger.exception("Failed to send welcome message")
-        except Exception as e:
-            logger.exception("Error processing IPN")
-        finally:
+                send_message(chat_id, "تم إلغاء اشتراكك. شكرًا لك.")
+            else:
+                send_message(chat_id, "ليس لديك اشتراك نشط للإلغاء.")
             session.close()
-    return jsonify({"status": "ok"}), 200
+        elif text == "/advice":
+            # هنا ضع دمج استراتيجياتك (مثال بسيط)
+            send_message(chat_id, "📊 لا توجد توصيات حالياً.")
+        else:
+            send_message(chat_id, "❓ أمر غير معروف، استخدم /help للمساعدة.")
+    return "ok"
 
-# ---------- start both ----------
+# === مسار NowPayments IPN Webhook ===
+@app.route(NOWPAYMENTS_ROUTE, methods=["POST"])
+def nowpayments_webhook():
+    signature = request.headers.get("x-nowpayments-sig")
+    if signature != NOWPAYMENTS_IPN_SECRET:
+        return "Unauthorized", 401
+
+    data = request.get_json()
+
+    payment_status = data.get("payment_status")
+    order_id = data.get("order_id")  # استخدم هذا كـ telegram_id أو user_id
+    amount = data.get("pay_amount")
+    currency = data.get("pay_currency")
+    created_at = datetime.utcnow()
+
+    if payment_status == "finished":
+        # تفعيل الاشتراك
+        session = SessionLocal()
+        user = get_user(session, str(order_id), create_if_not_exist=False)
+
+        if not user:
+            # إذا لم يكن موجودًا يمكن تخزين المؤقت أو رفض
+            session.close()
+            return jsonify({"error": "User not found"}), 404
+
+        # تحقق من الاشتراك النشط الحالي
+        active_sub = get_active_subscription(session, user.id)
+        if active_sub and active_sub.status == "active":
+            session.close()
+            return jsonify({"message": "Subscription already active"}), 200
+
+        start_date = datetime.utcnow()
+        # مثال: مدة الاشتراك 30 يوم
+        end_date = start_date + timedelta(days=30)
+
+        # إنشاء اشتراك جديد
+        new_sub = Subscription(
+            user_id=user.id,
+            start_date=start_date,
+            end_date=end_date,
+            status="active",
+            payment_id=str(data.get("payment_id")),
+            amount=amount,
+            currency=currency
+        )
+        session.add(new_sub)
+        session.commit()
+        session.close()
+
+        # إرسال رسالة ترحيب
+        send_message(int(user.telegram_id), f"✅ تم تفعيل اشتراكك بنجاح حتى {end_date.strftime('%Y-%m-%d')}\n"
+                                            f"فالك التوفيق  !")
+    return "ok"
+
+# === نقطة البداية ===
+@app.route("/")
+def home():
+    return "بوت التداول يعمل بنظام Webhook و NowPayments IPN."
+
 if __name__ == "__main__":
-    # run Flask in a thread, and Telegram bot in main thread
-    t = threading.Thread(target=start_telegram_bot, daemon=True)
-    t.start()
-    # run flask app (bind to port 5000 or env PORT)
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    print("تشغيل بوت التداول...")
+    app.run(host="0.0.0.0", port=PORT)
