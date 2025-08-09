@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, JSON, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, JSON, ForeignKey, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
 
@@ -15,6 +15,7 @@ class User(Base):
     username = Column(String, nullable=True)
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
+    is_admin = Column(Boolean, default=False)  # تم إضافة هذا الحقل
     created_at = Column(DateTime, default=datetime.utcnow)
 
     subscriptions = relationship("Subscription", back_populates="user")
