@@ -1,135 +1,111 @@
-import os
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+from sqlalchemy.orm import Session
+from models import SessionLocal, init_db
+from services import get_or_create_user, create_subscription, get_active_subscription, get_user_strategy, activate_subscription
+from payments import create_invoice_nowpayments
+import strategy_one
+import strategy_two
 from flask import Flask, request, jsonify
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Dispatcher
-from models import SessionLocal, User, Subscription, init_db
-from payments import create_invoice
-from config import TELEGRAM_TOKEN, ADMIN_IDS, NOWPAYMENTS_IPN_SECRET, SUBSCRIPTION_DURATION_DAYS
-from datetime import datetime, timedelta
-import hmac
-import hashlib
-import asyncio
+import threading
+import os
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO)
+
+# تهيئة قاعدة البيانات
+init_db()
 
 app = Flask(__name__)
 
-init_db()
-db = SessionLocal()
+SUBSCRIPTION_PLANS = {
+    "strategy_one": {"price": 40, "desc": "اشتراك 1 - استراتيجية 1"},
+    "strategy_two": {"price": 70, "desc": "اشتراك 2 - استراتيجية 2"},
+}
 
-# إعداد بوت التيليجرام باستخدام Long Polling مع Flask Dispatcher
-application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-dispatcher = application.dispatcher
+WELCOME_MESSAGES = {
+    "strategy_one": "أهلًا بك في اشتراك استراتيجية 1! نصيحة اليوم: تابع السوق وكن صبورًا.",
+    "strategy_two": "مرحبًا في اشتراك استراتيجية 2! تذكر دائماً إدارة المخاطر وتحديد وقف الخسارة.",
+}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    telegram_id = str(user.id)
-    db_user = db.query(User).filter(User.telegram_id == telegram_id).first()
-    if not db_user:
-        db_user = User(
-            telegram_id=telegram_id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name
-        )
-        db.add(db_user)
+def start(update: Update, context: CallbackContext):
+    db: Session = SessionLocal()
+    telegram_user = update.effective_user
+    user = get_or_create_user(db, str(telegram_user.id), telegram_user.username, telegram_user.first_name, telegram_user.last_name)
+
+    keyboard = [
+        [InlineKeyboardButton(f"{plan['desc']} - ${plan['price']}", callback_data=key)]
+        for key, plan in SUBSCRIPTION_PLANS.items()
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text("اختر الاشتراك المناسب لك:", reply_markup=reply_markup)
+    db.close()
+
+def subscription_choice(update: Update, context: CallbackContext):
+    query = update.callback_query
+    db: Session = SessionLocal()
+    user_id = str(query.from_user.id)
+    chosen_plan = query.data
+
+    subscription = create_subscription(db, user_id, chosen_plan, SUBSCRIPTION_PLANS[chosen_plan]['price'])
+
+    invoice_url, payment_id = create_invoice_nowpayments(subscription.id, SUBSCRIPTION_PLANS[chosen_plan]['price'])
+    if invoice_url:
+        subscription.payment_id = payment_id
         db.commit()
-    await update.message.reply_text(
-        "مرحباً بك في بوت إشارات التداول.\n"
-        "للاشتراك أرسل /subscribe\n"
-        "لمعرفة حالة اشتراكك أرسل /status\n"
-        "لتجديد الاشتراك أرسل /renew"
-    )
+        query.answer()
+        query.edit_message_text(text=f"لإتمام الدفع، يرجى زيارة الرابط التالي:\n{invoice_url}")
+    else:
+        query.answer()
+        query.edit_message_text(text="حدث خطأ أثناء إنشاء الفاتورة، حاول لاحقاً.")
+    db.close()
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def analysis(update: Update, context: CallbackContext):
+    db: Session = SessionLocal()
     telegram_id = str(update.effective_user.id)
-    db_user = db.query(User).filter(User.telegram_id == telegram_id).first()
-    if not db_user:
-        await update.message.reply_text("لم يتم العثور على بياناتك. الرجاء إرسال /start أولاً.")
+    strategy = get_user_strategy(db, telegram_id)
+    db.close()
+
+    if not strategy:
+        context.bot.send_message(chat_id=update.effective_chat.id,
+                                 text="لم يتم العثور على اشتراك نشط. يرجى الاشتراك أولاً.")
         return
-    active_sub = (
-        db.query(Subscription)
-        .filter(Subscription.user_id == db_user.id)
-        .filter(Subscription.status == "active")
-        .order_by(Subscription.end_date.desc())
-        .first()
-    )
-    if active_sub and active_sub.end_date > datetime.utcnow():
-        days_left = (active_sub.end_date - datetime.utcnow()).days
-        await update.message.reply_text(f"اشتراكك فعال وينتهي بعد {days_left} يوم.")
+
+    symbols = ["BTC-USDT", "ETH-USDT", "XRP-USDT"]
+    messages = []
+    for symbol in symbols:
+        if strategy == "strategy_one" and strategy_one.check_signal(symbol):
+            messages.append(f"📈 توصية شراء لـ {symbol} (استراتيجية 1)")
+        elif strategy == "strategy_two" and strategy_two.check_signal(symbol):
+            messages.append(f"🚀 توصية شراء لـ {symbol} (استراتيجية 2)")
+
+    if messages:
+        for msg in messages:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=msg)
     else:
-        await update.message.reply_text("ليس لديك اشتراك نشط حالياً. أرسل /subscribe للاشتراك.")
+        context.bot.send_message(chat_id=update.effective_chat.id, text="لا توجد توصيات حالياً.")
 
-async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
-    invoice = create_invoice(telegram_id)
-    if invoice:
-        url = invoice.get("invoice_url")
-        await update.message.reply_text(
-            f"يرجى دفع الاشتراك عبر الرابط التالي:\n{url}\n"
-            "بعد الدفع، سيتم تفعيل اشتراكك تلقائيًا."
-        )
-    else:
-        await update.message.reply_text("حدث خطأ أثناء إنشاء رابط الدفع، حاول لاحقًا.")
+def send_welcome_message(bot, telegram_id, strategy):
+    text = WELCOME_MESSAGES.get(strategy, "أهلاً بك في بوت التداول. يرجى الاشتراك لتلقي الإشارات.")
+    bot.send_message(chat_id=telegram_id, text=text)
 
-async def renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # يمكن إعادة استخدام create_invoice بنفس الطريقة
-    await subscribe(update, context)
-
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("status", status))
-dispatcher.add_handler(CommandHandler("subscribe", subscribe))
-dispatcher.add_handler(CommandHandler("renew", renew))
-
-@app.route("/webhook/payment", methods=["POST"])
-def payment_webhook():
-    raw_data = request.data
-    signature = request.headers.get("x-nowpayments-signature", "")
-
-    # تحقق التوقيع
-    computed = hmac.new(
-        NOWPAYMENTS_IPN_SECRET.encode("utf-8"),
-        raw_data,
-        hashlib.sha512
-    ).hexdigest()
-
-    if not hmac.compare_digest(computed, signature):
-        return jsonify({"error": "Invalid signature"}), 400
-
+@app.route('/nowpayments/webhook', methods=['POST'])
+def nowpayments_webhook():
     data = request.json
+    if not data:
+        return jsonify({"error": "No data"}), 400
+
+    payment_id = data.get("id")
     payment_status = data.get("payment_status")
-    currency = data.get("payment_currency")
-    paid_amount = float(data.get("paid_amount", 0))
-    price_amount = float(data.get("price_amount", 0))
-    telegram_id = data.get("order_id")
+    order_id = data.get("order_id")
 
-    if payment_status == "finished" and currency.lower() == "usdt" and paid_amount >= price_amount:
-        user = db.query(User).filter(User.telegram_id == telegram_id).first()
-        if user:
-            # تفعيل الاشتراك
-            now = datetime.utcnow()
-            new_sub = Subscription(
-                user_id=user.id,
-                status="active",
-                start_date=now,
-                end_date=now + timedelta(days=SUBSCRIPTION_DURATION_DAYS),
-                payment_id=data.get("payment_id"),
-                amount=paid_amount,
-                currency=currency
-            )
-            db.add(new_sub)
-            db.commit()
-            print(f"Subscription activated for user {telegram_id}")
-            return jsonify({"status": "success"}), 200
-
-    return jsonify({"error": "Payment not valid or incomplete"}), 400
-
-if __name__ == "__main__":
-    # تشغيل Flask و Telegram معاً
-    from threading import Thread
-
-    def run_flask():
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-
-    flask_thread = Thread(target=run_flask)
-    flask_thread.start()
-
-    asyncio.run(application.run_polling())
+    if payment_status == "finished" and order_id:
+        db: Session = SessionLocal()
+        subscription = activate_subscription(db, order_id)
+        if subscription:
+            # إرسال ترحيب للمستخدم بعد تفعيل الاشتراك
+            from telegram import Bot
+            bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
+            user = db.query(User).filter(User.id == subscription.user_id).first()
+           
