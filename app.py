@@ -7,22 +7,20 @@ import requests
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-# === إعدادات ===
+# إعدادات أساسية
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ضع_توكن_البوت_هنا")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "ضع_IPN_SECRET_هنا")
 
-WEBHOOK_ROUTE = f"/telegram-webhook"
-NOWPAYMENTS_ROUTE = f"/nowpayments-webhook"
+WEBHOOK_ROUTE = f"/market-signals-bot/telegram-webhook"
+NOWPAYMENTS_ROUTE = f"/market-signals-bot/nowpayments-webhook"
 PORT = int(os.getenv("PORT", 5000))
 
-# === قاعدة البيانات ===
-DATABASE_URL = "sqlite:///./bot_subscriptions.db"
+# قاعدة البيانات
+DATABASE_URL = "sqlite:///./market_signals_bot.db"
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
-
-# === موديلات البيانات ===
 
 class User(Base):
     __tablename__ = "users"
@@ -48,10 +46,7 @@ class Subscription(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# === تهيئة Flask ===
 app = Flask(__name__)
-
-# === دوال مساعدة ===
 
 def send_message(chat_id, text):
     requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
@@ -91,7 +86,6 @@ def expire_subscriptions():
     session.commit()
     session.close()
 
-# === مسار Telegram Webhook ===
 @app.route(WEBHOOK_ROUTE, methods=["POST"])
 def telegram_webhook():
     expire_subscriptions()
@@ -148,13 +142,12 @@ def telegram_webhook():
                 send_message(chat_id, "ليس لديك اشتراك نشط للإلغاء.")
             session.close()
         elif text == "/advice":
-            # هنا ضع دمج استراتيجياتك (مثال بسيط)
+            # دمج استراتيجياتك هنا
             send_message(chat_id, "📊 لا توجد توصيات حالياً.")
         else:
             send_message(chat_id, "❓ أمر غير معروف، استخدم /help للمساعدة.")
     return "ok"
 
-# === مسار NowPayments IPN Webhook ===
 @app.route(NOWPAYMENTS_ROUTE, methods=["POST"])
 def nowpayments_webhook():
     signature = request.headers.get("x-nowpayments-sig")
@@ -164,32 +157,26 @@ def nowpayments_webhook():
     data = request.get_json()
 
     payment_status = data.get("payment_status")
-    order_id = data.get("order_id")  # استخدم هذا كـ telegram_id أو user_id
+    order_id = data.get("order_id")
     amount = data.get("pay_amount")
     currency = data.get("pay_currency")
-    created_at = datetime.utcnow()
 
     if payment_status == "finished":
-        # تفعيل الاشتراك
         session = SessionLocal()
         user = get_user(session, str(order_id), create_if_not_exist=False)
 
         if not user:
-            # إذا لم يكن موجودًا يمكن تخزين المؤقت أو رفض
             session.close()
             return jsonify({"error": "User not found"}), 404
 
-        # تحقق من الاشتراك النشط الحالي
         active_sub = get_active_subscription(session, user.id)
         if active_sub and active_sub.status == "active":
             session.close()
             return jsonify({"message": "Subscription already active"}), 200
 
         start_date = datetime.utcnow()
-        # مثال: مدة الاشتراك 30 يوم
         end_date = start_date + timedelta(days=30)
 
-        # إنشاء اشتراك جديد
         new_sub = Subscription(
             user_id=user.id,
             start_date=start_date,
@@ -203,16 +190,14 @@ def nowpayments_webhook():
         session.commit()
         session.close()
 
-        # إرسال رسالة ترحيب
         send_message(int(user.telegram_id), f"✅ تم تفعيل اشتراكك بنجاح حتى {end_date.strftime('%Y-%m-%d')}\n"
-                                            f"فالك التوفيق  !")
+                                            f"بسم الله  !")
     return "ok"
 
-# === نقطة البداية ===
 @app.route("/")
 def home():
-    return "بوت التداول يعمل بنظام Webhook و NowPayments IPN."
+    return "بوت market-signals-bot يعمل بنظام Webhook و NowPayments IPN."
 
 if __name__ == "__main__":
-    print("تشغيل بوت التداول...")
+    print("تشغيل بوت market-signals-bot...")
     app.run(host="0.0.0.0", port=PORT)
