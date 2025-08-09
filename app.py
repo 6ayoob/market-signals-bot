@@ -1,132 +1,154 @@
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
-from sqlalchemy.orm import Session
-from models import SessionLocal, init_db
-from services import get_or_create_user, create_subscription, get_active_subscription, get_user_strategy, activate_subscription
-from payments import create_invoice_nowpayments
-import strategy_one
-import strategy_two
-from flask import Flask, request, jsonify
-import threading
 import os
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+from models import SessionLocal, User, Subscription
 from datetime import datetime
+import strategy_one  # ملف الاستراتيجية 1، فيه check_signal(symbol)
+import strategy_two  # ملف الاستراتيجية 2، فيه check_signal(symbol)
 
-logging.basicConfig(level=logging.INFO)
-
-# تهيئة قاعدة البيانات
-init_db()
-
-app = Flask(__name__)
-
-SUBSCRIPTION_PLANS = {
-    "strategy_one": {"price": 40, "desc": "اشتراك 1 - استراتيجية 1"},
-    "strategy_two": {"price": 70, "desc": "اشتراك 2 - استراتيجية 2"},
-}
-
-WELCOME_MESSAGES = {
-    "strategy_one": "أهلًا بك في اشتراك استراتيجية 1! نصيحة اليوم: تابع السوق وكن صبورًا.",
-    "strategy_two": "مرحبًا في اشتراك استراتيجية 2! تذكر دائماً إدارة المخاطر وتحديد وقف الخسارة.",
-}
+# دالة لجلب الاشتراك النشط للمستخدم من DB
+def get_active_subscription(session, telegram_id: str):
+    user = session.query(User).filter_by(telegram_id=telegram_id).first()
+    if not user:
+        return None
+    sub = session.query(Subscription).filter(
+        Subscription.user_id == user.id,
+        Subscription.status == "active",
+        Subscription.start_date <= datetime.utcnow(),
+        Subscription.end_date >= datetime.utcnow()
+    ).first()
+    return sub
 
 def start(update: Update, context: CallbackContext):
-    db: Session = SessionLocal()
-    telegram_user = update.effective_user
-    user = get_or_create_user(db, str(telegram_user.id), telegram_user.username, telegram_user.first_name, telegram_user.last_name)
-
     keyboard = [
-        [InlineKeyboardButton(f"{plan['desc']} - ${plan['price']}", callback_data=key)]
-        for key, plan in SUBSCRIPTION_PLANS.items()
+        [InlineKeyboardButton("اشتراك 1 - $40", callback_data='strategy_one')],
+        [InlineKeyboardButton("اشتراك 2 - $70", callback_data='strategy_two')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("اختر الاشتراك المناسب لك:", reply_markup=reply_markup)
-    db.close()
+    update.message.reply_text('أهلاً! اختر الاشتراك المناسب لك:', reply_markup=reply_markup)
 
 def subscription_choice(update: Update, context: CallbackContext):
     query = update.callback_query
-    db: Session = SessionLocal()
-    user_id = str(query.from_user.id)
-    chosen_plan = query.data
+    chosen = query.data
+    telegram_id = str(query.from_user.id)
 
-    subscription = create_subscription(db, user_id, chosen_plan, SUBSCRIPTION_PLANS[chosen_plan]['price'])
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(telegram_id=telegram_id).first()
+        if not user:
+            user = User(
+                telegram_id=telegram_id,
+                username=query.from_user.username,
+                first_name=query.from_user.first_name,
+                last_name=query.from_user.last_name
+            )
+            session.add(user)
+            session.commit()
 
-    invoice_url, payment_id = create_invoice_nowpayments(subscription.id, SUBSCRIPTION_PLANS[chosen_plan]['price'])
-    if invoice_url:
-        subscription.payment_id = payment_id
-        db.commit()
-        query.answer()
-        query.edit_message_text(text=f"لإتمام الدفع، يرجى زيارة الرابط التالي:\n{invoice_url}")
-    else:
-        query.answer()
-        query.edit_message_text(text="حدث خطأ أثناء إنشاء الفاتورة، حاول لاحقاً.")
-    db.close()
+        # منع الاشتراك المتكرر (pending أو active)
+        existing_sub = session.query(Subscription).filter(
+            Subscription.user_id == user.id,
+            Subscription.status.in_(["pending", "active"])
+        ).first()
+
+        if existing_sub:
+            query.answer()
+            query.edit_message_text("لديك اشتراك مفتوح أو قيد الانتظار، يرجى إتمام الدفع أو انتظار انتهاء الاشتراك.")
+            return
+
+        new_sub = Subscription(
+            user_id=user.id,
+            status="pending",  # ينتظر الدفع
+            start_date=None,
+            end_date=None,
+            payment_id=None,
+            amount=40 if chosen == "strategy_one" else 70,
+            currency="USD"
+        )
+        session.add(new_sub)
+        session.commit()
+    finally:
+        session.close()
+
+    query.answer()
+    query.edit_message_text(f"اخترت {chosen}، سيتم إرسال رابط الدفع قريبًا.")
 
 def analysis(update: Update, context: CallbackContext):
-    db: Session = SessionLocal()
     telegram_id = str(update.effective_user.id)
-    strategy = get_user_strategy(db, telegram_id)
-    db.close()
+    session = SessionLocal()
+    try:
+        subscription = get_active_subscription(session, telegram_id)
+    finally:
+        session.close()
 
-    if not strategy:
-        context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text="لم يتم العثور على اشتراك نشط. يرجى الاشتراك أولاً.")
+    if not subscription:
+        update.message.reply_text("ليس لديك اشتراك نشط، يرجى الاشتراك أولاً.")
         return
 
-    symbols = ["BTC-USDT", "ETH-USDT", "XRP-USDT"]
     messages = []
-    for symbol in symbols:
-        if strategy == "strategy_one" and strategy_one.check_signal(symbol):
-            messages.append(f"📈 توصية شراء لـ {symbol} (استراتيجية 1)")
-        elif strategy == "strategy_two" and strategy_two.check_signal(symbol):
-            messages.append(f"🚀 توصية شراء لـ {symbol} (استراتيجية 2)")
+    # استبدل هذه الرموز بالقائمة الحقيقية أو قواعد بيانات المشروع
+    symbols = ["BTC-USDT", "ETH-USDT", "XRP-USDT"]
+
+    if subscription.amount == 40:
+        for symbol in symbols:
+            if strategy_one.check_signal(symbol):
+                messages.append(f"📈 توصية شراء لـ {symbol} (استراتيجية 1)")
+    else:
+        for symbol in symbols:
+            if strategy_two.check_signal(symbol):
+                messages.append(f"🚀 توصية شراء لـ {symbol} (استراتيجية 2)")
 
     if messages:
         for msg in messages:
-            context.bot.send_message(chat_id=update.effective_chat.id, text=msg)
+            update.message.reply_text(msg)
     else:
-        context.bot.send_message(chat_id=update.effective_chat.id, text="لا توجد توصيات حالياً.")
+        update.message.reply_text("لا توجد توصيات حالياً.")
 
-def send_welcome_message(bot, telegram_id, strategy):
-    text = WELCOME_MESSAGES.get(strategy, "أهلاً بك في بوت التداول. يرجى الاشتراك لتلقي الإشارات.")
-    bot.send_message(chat_id=telegram_id, text=text)
+def status(update: Update, context: CallbackContext):
+    telegram_id = str(update.effective_user.id)
+    session = SessionLocal()
+    try:
+        subscription = get_active_subscription(session, telegram_id)
+    finally:
+        session.close()
 
-@app.route('/nowpayments/webhook', methods=['POST'])
-def nowpayments_webhook():
-    data = request.json
-    if not data:
-        return jsonify({"error": "No data"}), 400
+    if subscription:
+        text = (
+            f"اشتراكك: {'اشتراك 1' if subscription.amount == 40 else 'اشتراك 2'}\n"
+            f"الحالة: {subscription.status}\n"
+            f"ينتهي في: {subscription.end_date.strftime('%Y-%m-%d') if subscription.end_date else 'غير محدد'}"
+        )
+    else:
+        text = "لا يوجد اشتراك نشط حالياً."
 
-    payment_id = data.get("id")
-    payment_status = data.get("payment_status")
-    order_id = data.get("order_id")
+    update.message.reply_text(text)
 
-    if payment_status == "finished" and order_id:
-        db: Session = SessionLocal()
-        subscription = activate_subscription(db, order_id)
-        if subscription:
-            # إرسال ترحيب للمستخدم بعد تفعيل الاشتراك
-            from telegram import Bot
-            bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
-            user = db.query(User).filter(User.id == subscription.user_id).first()
-            if user:
-                send_welcome_message(bot, user.telegram_id, subscription.strategy)
-        db.close()
-    return jsonify({"status": "ok"})
+def help_command(update: Update, context: CallbackContext):
+    text = (
+        "/start - بدء الاشتراك\n"
+        "/analysis - استلام التوصيات\n"
+        "/status - حالة الاشتراك\n"
+        "/help - عرض المساعدة"
+    )
+    update.message.reply_text(text)
 
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+def main():
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    if not TELEGRAM_TOKEN:
+        print("خطأ: لم يتم تعيين متغير TELEGRAM_TOKEN")
+        return
 
-def run_telegram_bot():
-    updater = Updater(os.getenv("TELEGRAM_TOKEN"))
+    updater = Updater(TELEGRAM_TOKEN)
     dp = updater.dispatcher
+
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CallbackQueryHandler(subscription_choice))
     dp.add_handler(CommandHandler("analysis", analysis))
+    dp.add_handler(CommandHandler("status", status))
+    dp.add_handler(CommandHandler("help", help_command))
 
     updater.start_polling()
     updater.idle()
 
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=run_flask).start()
-    threading.Thread(target=run_telegram_bot).start()
+    main()
